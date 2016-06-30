@@ -36,7 +36,9 @@ int esc_1, esc_2, esc_3, esc_4;
 int throttle, battery_voltage;
 int cal_int, start, gyro_address;
 int receiver_input[5];
+int temperature;
 
+long acc_x, acc_y, acc_z, acc_total_vector;
 unsigned long timer_channel_1, timer_channel_2, timer_channel_3, timer_channel_4, esc_timer, esc_loop_timer;
 unsigned long timer_1, timer_2, timer_3, timer_4, current_time;
 unsigned long loop_timer;
@@ -49,6 +51,11 @@ float pid_i_mem_roll, pid_roll_setpoint, gyro_roll_input, pid_output_roll, pid_l
 float pid_i_mem_pitch, pid_pitch_setpoint, gyro_pitch_input, pid_output_pitch, pid_last_pitch_d_error;
 float pid_i_mem_yaw, pid_yaw_setpoint, gyro_yaw_input, pid_output_yaw, pid_last_yaw_d_error;
 float bttry_compens;
+float angle_pitch, angle_roll;
+float angle_roll_acc, angle_pitch_acc;
+
+boolean auto_stabilize;
+boolean set_gyro_angles;
 
 /////////////////////////////////////////////////////////////////////
 // SETUP Procedure
@@ -72,7 +79,7 @@ void setup(){
   while(eeprom_data[33] != 'J' || eeprom_data[34] != 'M' || eeprom_data[35] != 'B')delay(10);
 
 
-  set_gyro_registers();                 //Set the MPU6050 gyro registers.
+  imu_setup();                 //Set the MPU6050 gyro registers.
   
   // 1000us puls to prevent beeping while we wait for the 5sec delay
   for (cal_int = 0; cal_int < 1250 ; cal_int ++){  //Wait 5 seconds before continuing.
@@ -86,7 +93,7 @@ void setup(){
   for (cal_int = 0; cal_int < 2000 ; cal_int ++){   //Take 2000 readings
     if(cal_int % 15 == 0) 
       digitalWrite(12, !digitalRead(12));           // LED toggle
-    gyro_read();                                    //Read the gyro output.
+    imu_read();                                    //Read the gyro output.
     gyro_axis_cal[1] += gyro_axis[1];               //Ad roll value to gyro_roll_cal.
     gyro_axis_cal[2] += gyro_axis[2];               //Ad pitch value to gyro_pitch_cal.
     gyro_axis_cal[3] += gyro_axis[3];               //Ad yaw value to gyro_yaw_cal.
@@ -117,6 +124,7 @@ void setup(){
     
   }
   start = 0;       //Set start back to 0.
+  auto_stabilize = true; //Set auto_strabilization
   
   //Load the battery voltage to the battery_voltage variable.
   //65 is the voltage compensation for the diode.
@@ -129,13 +137,18 @@ void setup(){
   PORTB &= ~_BV(PB4);
 }
 
-void set_gyro_registers() {
+void imu_setup() {
   Wire.beginTransmission(gyro_address);  //Start communication with 6050 address
     Wire.write(0x6B);                    //Write to the PWR_MGMT_1 register (6B hex)
     Wire.write(0x00);                    //Set the register bits as 00000000 to activate gyro
     Wire.endTransmission();              //End the transmission with the gyro.
 
-
+    //Configure the accelerometer (+/-8g)
+    Wire.beginTransmission(0x68);         
+    Wire.write(0x1C);                     //Send the requested starting register
+    Wire.write(0x10);                     //Set the requested starting register
+    Wire.endTransmission();               
+    
     /*
      * GYRO_FS_SEL - 1B register - B[4:3] (Gyro Full Scale Select)
      * 00 = ±250dps
@@ -179,13 +192,17 @@ void set_gyro_registers() {
     Wire.endTransmission();     
 }
 
-void gyro_read(){
+void imu_read(){
   Wire.beginTransmission(gyro_address);                        
-  Wire.write(0x43);                                   //Start reading @ register 43h and auto increment with every read
+  Wire.write(0x3B);                                   //Start reading @ register 43h and auto increment with every read
   Wire.endTransmission();
-  Wire.requestFrom(gyro_address,6);                   //Request 6 bytes from the gyro
-  while(Wire.available() < 6);                        //Wait until the 6 bytes are received
+  Wire.requestFrom(gyro_address,14);                   //Request 14 bytes from the gyro
+  while(Wire.available() < 14);                        //Wait until the 6 bytes are received
   // Read the data
+  acc_x = Wire.read()<<8|Wire.read();                  //Add the low and high byte to the acc_x variable
+  acc_y = Wire.read()<<8|Wire.read();                  //Add the low and high byte to the acc_y variable
+  acc_z = Wire.read()<<8|Wire.read();                  //Add the low and high byte to the acc_z variable
+  temperature = Wire.read()<<8|Wire.read();            //Add the low and high byte to the temperature variable
   gyro_axis[1] = Wire.read()<<8|Wire.read();
   gyro_axis[2] = Wire.read()<<8|Wire.read();
   gyro_axis[3] = Wire.read()<<8|Wire.read();
@@ -242,19 +259,26 @@ void loop() {
   receiver_input_channel_4 = get_receiver_channel(4);      //Convert the actual receiver signals for yaw to the standard 1000 - 2000us.
 
   // Read the data from the gyroscope
-  gyro_read();
+  imu_read();
 
-  /*
-   * For MPU5060 With FS_SEL= 1 - 500dps
-   * 1 degree/s = 65.5 unit/sec
-   * To filter the gyro data we use a complementary filter of 20%/80%
-  */
-  gyro_roll_input = (gyro_roll_input * 0.8) + ((gyro_roll / 65.5) * 0.2);      
-  gyro_pitch_input = (gyro_pitch_input * 0.8) + ((gyro_pitch / 65.5) * 0.2);         
-  gyro_yaw_input = (gyro_yaw_input * 0.8) + ((gyro_yaw / 65.5) * 0.2);   
-  
+  if(auto_stabilize == true){
+      stabilize();
+      //To dampen the pitch and roll angles a complementary filter is used
+      gyro_pitch_input = gyro_pitch_input * 0.9 + angle_pitch * 0.1;   //Take 90% of the output pitch value and add 10% of the raw pitch value
+      gyro_roll_input = gyro_roll_input * 0.9 + angle_roll * 0.1;      //Take 90% of the output roll value and add 10% of the raw roll value
+  }
+  else {
+    /*
+     * For MPU5060 With FS_SEL= 1 - 500dps
+     * 1 degree/s = 65.5 unit/sec
+     * To filter the gyro data we use a complementary filter of 20%/80%
+    */
+    gyro_roll_input = (gyro_roll_input * 0.8) + ((gyro_roll / 65.5) * 0.2);      
+    gyro_pitch_input = (gyro_pitch_input * 0.8) + ((gyro_pitch / 65.5) * 0.2);         
+  }
+  // The yaw is not required for stabilization
+  gyro_yaw_input = (gyro_yaw_input * 0.8) + ((gyro_yaw / 65.5) * 0.2); 
   // GOOD IDEA TO PRINT THE ABOVE DATA AND DO AN EXCEL SPREADSHEET(W&W/O PROPS)
-
 
   //STEP 1. Arm Motors: Throttle LOW, Yaw LEFT
   if(receiver_input_channel_3 < 1050 && receiver_input_channel_4 < 1050)start = 1;
@@ -470,8 +494,37 @@ void calculate_pid(){
   pid_last_yaw_d_error = pid_error_temp;
 }
 
+void stabilize() {
+  //Gyro angle calculations
+  //0.0000611 = 1 / (250Hz / 65.5)
+  angle_pitch += gyro_pitch * 0.0000611;                                   //Calculate the traveled pitch angle and add this to the angle_pitch variable
+  angle_roll += gyro_roll * 0.0000611;                                    //Calculate the traveled roll angle and add this to the angle_roll variable
+
+  //0.000001066 = 0.0000611 * (3.142(PI) / 180degr) The Arduino sin function is in radians
+  angle_pitch += angle_roll * sin(gyro_yaw * 0.000001066);               //If the IMU has yawed transfer the roll angle to the pitch angel
+  angle_roll -= angle_pitch * sin(gyro_yaw * 0.000001066);               //If the IMU has yawed transfer the pitch angle to the roll angel
+
+  //Accelerometer angle calculations
+  acc_total_vector = sqrt((acc_x*acc_x)+(acc_y*acc_y)+(acc_z*acc_z));  //Calculate the total accelerometer vector
+  //57.296 = 1 / (3.142 / 180) The Arduino asin function is in radians
+  angle_pitch_acc = asin((float)acc_y/acc_total_vector)* 57.296;       //Calculate the pitch angle
+  angle_roll_acc = asin((float)acc_x/acc_total_vector)* -57.296;       //Calculate the roll angle
 
 
+   //Place the MPU-6050 spirit level and note the values in the following two lines for calibration
+  angle_pitch_acc -= 0.0;                                              //Accelerometer calibration value for pitch
+  angle_roll_acc -= 0.0;                                               //Accelerometer calibration value for roll
+
+  if(set_gyro_angles){                                                 //If the IMU is already started
+    angle_pitch = angle_pitch * 0.9996 + angle_pitch_acc * 0.0004;     //Correct the drift of the gyro pitch angle with the accelerometer pitch angle
+    angle_roll = angle_roll * 0.9996 + angle_roll_acc * 0.0004;        //Correct the drift of the gyro roll angle with the accelerometer roll angle
+  }
+  else{                                                                //At first start
+    angle_pitch = angle_pitch_acc;                                     //Set the gyro pitch angle equal to the accelerometer pitch angle 
+    angle_roll = angle_roll_acc;                                       //Set the gyro roll angle equal to the accelerometer roll angle 
+    set_gyro_angles = true;                                            //Set the IMU started flag
+  }
+}
 
 
 
