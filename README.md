@@ -1,2 +1,2 @@
 # Arduquad
-This is the arduino based project to make a quadcopter stabilization algorithm using Machine Learning
+Arduino UNO based flight controller code using MPU6050 IMU. The program uses PID algoritms to stabilize the quad copter
